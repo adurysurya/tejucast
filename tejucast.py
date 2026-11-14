@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tvcast - stream your Linux (Wayland) desktop to a Google TV / Chromecast.
+"""tejucast - stream your Linux (Wayland) desktop to a Google TV / Chromecast.
 
 How it works
   1. Asks the desktop's ScreenCast portal (KDE/GNOME) for a screen or window.
@@ -30,39 +30,114 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gio, GLib, Gst  # noqa: E402
 
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "tvcast")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "tejucast")
 TOKEN_FILE = os.path.join(CONFIG_DIR, "restore_token")
 
 
+STATUS_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "tejucast")
+STATUS_FILE = os.path.join(STATUS_DIR, "status.json")
+UNIT = "tejucast"
+
+
+class Status:
+    """Live state for front-ends (the Plasma tray widget reads this file)."""
+
+    def __init__(self):
+        self.data = {}
+        self.enabled = False
+        self.lock = threading.Lock()
+
+    def update(self, **kw):
+        if not self.enabled:
+            return
+        with self.lock:
+            self.data.update(kw, pid=os.getpid(), updated=time.time())
+            try:
+                os.makedirs(STATUS_DIR, exist_ok=True)
+                tmp = STATUS_FILE + f".{os.getpid()}"
+                with open(tmp, "w") as f:
+                    json.dump(self.data, f)
+                os.replace(tmp, STATUS_FILE)
+            except OSError:
+                pass
+
+
+STATUS = Status()
+
+
 def log(*a):
-    print("[tvcast]", *a, flush=True)
+    msg = " ".join(str(x) for x in a)
+    print("[tejucast]", msg, flush=True)
+    STATUS.update(message=msg)
 
 
 # --------------------------------------------------------------------------- discovery
 
-def discover(timeout=5):
-    """Find Cast devices via avahi. Returns list of dicts(name, host, port)."""
+CACHE_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "tejucast",
+                          "devices.json")
+
+
+def _parse_avahi_line(line):
+    f = line.split(";")
+    if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+        return None
+    txt = {}
+    for tok in f[9].split('" "'):
+        tok = tok.strip('"')
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            txt[k] = v
+    return {"name": txt.get("fn", f[3]), "model": txt.get("md", ""), "host": f[7], "port": int(f[8]),
+            "id": txt.get("id", f[3])}
+
+
+def discover(timeout=3.0, use_cache=True):
+    """Find Cast devices via avahi (listens `timeout` s; the TV can be slow to answer).
+    Devices seen before are remembered so front-ends can list them instantly."""
+    import select
+    found = {}
     try:
-        out = subprocess.run(["avahi-browse", "-rpt", "_googlecast._tcp"],
-                             capture_output=True, text=True, timeout=timeout + 5).stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-    devices, seen = [], set()
-    for line in out.splitlines():
-        f = line.split(";")
-        if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
-            continue
-        txt = {}
-        for tok in f[9].split('" "'):
-            tok = tok.strip('"')
-            if "=" in tok:
-                k, v = tok.split("=", 1)
-                txt[k] = v
-        name = txt.get("fn", f[3])
-        if (name, f[7]) in seen:
-            continue
-        seen.add((name, f[7]))
-        devices.append({"name": name, "model": txt.get("md", ""), "host": f[7], "port": int(f[8])})
+        proc = subprocess.Popen(["avahi-browse", "-rp", "_googlecast._tcp"], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except FileNotFoundError:
+        proc = None
+    if proc:
+        end = time.time() + timeout
+        buf = ""
+        try:
+            while time.time() < end:
+                r, _, _ = select.select([proc.stdout], [], [], max(0.0, end - time.time()))
+                if not r:
+                    break
+                chunk = os.read(proc.stdout.fileno(), 65536).decode(errors="replace")
+                if not chunk:
+                    break
+                buf += chunk
+                *lines, buf = buf.split("\n")
+                for line in lines:
+                    d = _parse_avahi_line(line)
+                    if d:
+                        found[d["id"]] = d
+        finally:
+            proc.kill()
+            proc.wait()
+    cache = {}
+    try:
+        with open(CACHE_FILE) as f:
+            cache = {d["id"]: d for d in json.load(f)}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if found:
+        cache.update(found)
+        try:
+            os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+            with open(CACHE_FILE, "w") as f:
+                json.dump(list(cache.values()), f)
+        except OSError:
+            pass
+    devices = [dict(d, online=True) for d in found.values()]
+    if use_cache:
+        devices += [dict(d, online=False) for k, d in cache.items() if k not in found]
     return devices
 
 
@@ -298,7 +373,7 @@ class Portal:
 
     def _request(self, method, sig, args_fn):
         self.n += 1
-        token = f"tvcast{os.getpid()}_{self.n}"
+        token = f"tejucast{os.getpid()}_{self.n}"
         path = f"/org/freedesktop/portal/desktop/request/{self.sender}/{token}"
         loop, result = GLib.MainLoop(), {}
 
@@ -380,7 +455,7 @@ def make_http_server(directory, port):
             self.end_headers()
 
         def log_message(self, fmt, *a):
-            if os.environ.get("TVCAST_HTTPLOG"):
+            if os.environ.get("TEJUCAST_HTTPLOG"):
                 log("http", self.client_address[0], fmt % a)
 
     srv = ThreadingHTTPServer(("0.0.0.0", port), partial(Handler, directory=directory))
@@ -402,13 +477,13 @@ class TvAudioSink:
     """A virtual speaker named after the TV. While casting it is the default output, so
     sound goes to the TV instead of the laptop, and it shows up in the audio settings."""
 
-    SINK = "tvcast_tv"
+    SINK = "tejucast_tv"
 
     def __init__(self, tv_name):
         self.module = None
         self.previous = None
         self._unload_stale()
-        desc = f"{tv_name} (tvcast)".replace('"', "")
+        desc = f"{tv_name} (Teju Cast)".replace('"', "")
         props = f'device.description="{desc}" monitor.channel-volumes=true device.icon_name=video-television'
         r = subprocess.run(["pactl", "load-module", "module-null-sink", f"sink_name={self.SINK}",
                             "rate=48000", "channels=2", f"sink_properties={props}"],
@@ -536,8 +611,30 @@ def main():
     p.add_argument("--hls", action="store_true", help="use the older HLS video-stream mode (~4 s delay)")
     p.add_argument("--no-cast", action="store_true", help="only serve the HLS stream (for testing in VLC)")
     p.add_argument("--test", action="store_true", help="send a test pattern instead of the screen")
+    p.add_argument("--label", help="display name for the TV (with --host)")
+    p.add_argument("--json", action="store_true", help="with --list: machine-readable output")
+    p.add_argument("--background", action="store_true",
+                   help="run as a background user service (replacing any running one)")
+    p.add_argument("--stop", action="store_true", help="stop the background service")
+    p.add_argument("--status", action="store_true", help="print the current status as JSON")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
+
+    if args.stop:
+        subprocess.run(["systemctl", "--user", "stop", UNIT], capture_output=True)
+        return 0
+    if args.status:
+        print(json.dumps(read_status()))
+        return 0
+    if args.background:
+        return launch_background()
+
+    def _term(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)  # clean up (audio, TV session) even before the main loop
+    STATUS.enabled = not args.list
+    STATUS.update(state="starting", mode="extend" if args.extend else ("hls" if args.hls else "mirror"),
+                  tv=args.label or args.device or args.host, started=time.time())
 
     if args.forget:
         for f in (TOKEN_FILE, TOKEN_FILE + "-extend"):
@@ -545,10 +642,13 @@ def main():
                 os.remove(f)
 
     # ---- pick a TV
-    host, name = args.host, args.host
+    host, name = args.host, args.label or args.host
     if args.list or (not host and not args.no_cast):
+        if args.list and args.json:
+            print(json.dumps(discover()))
+            return 0
         log("Looking for Cast devices...")
-        devs = discover()
+        devs = discover(use_cache=False)
         if args.list:
             for d in devs:
                 print(f"  {d['name']:<30} {d['model']:<20} {d['host']}")
@@ -563,10 +663,12 @@ def main():
         host, name = devs[0]["host"], devs[0]["name"]
     if host:
         log(f"Target: {name} ({host})")
+        STATUS.update(tv=name, host=host)
 
     Gst.init(None)
     fd = node = None
     if not args.test:
+        STATUS.update(state="choosing")
         if args.extend:
             log("Creating a virtual monitor for the TV...")
         else:
@@ -714,13 +816,14 @@ def run_mirror(args, host, name, fd, node):
         offers.append(s.offer(len(offers), channels=1, maxFrameRate=f"{args.fps * 1000}/1000",
                               maxBitRate=args.bitrate * 1000, resolutions=[{"width": w, "height": h}]))
 
+    STATUS.update(state="connecting")
     log(f"Connecting to {name}...")
     try:
         cc = CastClient(host)
         transport, session_id, answer = cm.negotiate(cc, offers, log, NS_RECEIVER, NS_CONN, _app_from_status)
     except Exception as e:  # noqa: BLE001
         log("Could not start mirroring:", e)
-        log("Tip: `tvcast --hls` uses the slower but more compatible video-stream mode.")
+        log("Tip: `tejucast --hls` uses the slower but more compatible video-stream mode.")
         return 1
     if args.verbose:
         log("ANSWER:", json.dumps(answer))
@@ -810,9 +913,11 @@ def run_mirror(args, host, name, fd, node):
         try:
             while not runner.stop.is_set():
                 m = cc.recv()
-                if args.verbose and time.time() - last_stats > 5:
+                if time.time() - last_stats > 5:
                     last_stats = time.time()
-                    log("stats", {s.kind: s.stats for s in active})
+                    STATUS.update(stats={s.kind: dict(s.stats) for s in active})
+                    if args.verbose:
+                        log("stats", {s.kind: s.stats for s in active})
                 if not m:
                     continue
                 if m["ns"] == NS_RECEIVER and m["data"].get("type") == "RECEIVER_STATUS":
@@ -828,6 +933,8 @@ def run_mirror(args, host, name, fd, node):
 
     th = threading.Thread(target=keepalive, daemon=True)
     th.start()
+    STATUS.update(state="streaming", codec=vstream.codec, width=w, height=h, fps=args.fps, delay=delay,
+                  audio=bool(astream), streaming_since=time.time())
     log(f"Mirroring to {name}. Ctrl+C to stop.")
     try:
         runner.loop.run()
@@ -849,7 +956,7 @@ def run_mirror(args, host, name, fd, node):
 # --------------------------------------------------------------------------- mode 2: HLS (compatible, ~4 s delay)
 
 def run_hls(args, host, name, fd, node):
-    outdir = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"tvcast-{os.getpid()}")
+    outdir = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"tejucast-{os.getpid()}")
     os.makedirs(outdir, exist_ok=True)
     pipeline = build_pipeline(args, outdir, fd, node)
     ip = local_ip_towards(host or "192.0.2.1")
@@ -875,6 +982,7 @@ def run_hls(args, host, name, fd, node):
             log("Serving only (--no-cast). Open the URL above in VLC/mpv. Ctrl+C to stop.")
             return
         log(f"Casting to {name}... Ctrl+C to stop.")
+        STATUS.update(state="streaming", codec="hls", streaming_since=time.time())
         cast_session(host, url, "Desktop", runner.stop, runner.shutdown)
 
     th = threading.Thread(target=caster, daemon=True)
@@ -891,5 +999,53 @@ def run_hls(args, host, name, fd, node):
     return runner.exit_code
 
 
+def read_status():
+    try:
+        with open(STATUS_FILE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {"state": "stopped"}
+    alive = False
+    try:
+        os.kill(int(st.get("pid", 0)), 0)
+        alive = bool(st.get("pid"))
+    except (OSError, ValueError):
+        pass
+    if not alive and st.get("state") not in ("stopped", "error"):
+        st["state"] = "stopped"
+    return st
+
+
+def launch_background():
+    """Re-run ourselves (minus --background) as a transient systemd user service."""
+    argv = [a for a in sys.argv[1:] if a != "--background"]
+    subprocess.run(["systemctl", "--user", "stop", UNIT], capture_output=True)
+    subprocess.run(["systemctl", "--user", "reset-failed", UNIT], capture_output=True)
+    cmd = ["systemd-run", "--user", f"--unit={UNIT}", "--collect", "--quiet",
+           "--description=tejucast screen casting", "-p", "KillSignal=SIGTERM",
+           sys.executable, os.path.realpath(__file__)] + argv
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr.strip(), file=sys.stderr)
+        return 1
+    print(f"tejucast started in the background (journalctl --user -u {UNIT} -f to watch, tejucast --stop to stop)")
+    return 0
+
+
+def entry():
+    code = 1
+    try:
+        code = main()
+    except KeyboardInterrupt:
+        code = 0
+    finally:
+        if STATUS.enabled:
+            if code:
+                STATUS.update(state="error")
+            else:
+                STATUS.update(state="stopped", message="Stopped")
+    return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())

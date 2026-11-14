@@ -1,23 +1,23 @@
-# tvcast
+# Teju Cast
 
 Stream your Linux desktop to a **Google TV / Chromecast** with low delay: mirror your screen, or use the TV as a **second monitor**. Sound plays through the TV.
 
-tvcast uses the same Cast Streaming protocol as Chrome's "Cast screen". It's a single Python tool that relies only on what your distro already ships (GStreamer, PipeWire, PyGObject, OpenSSL). There's no pip install and nothing to install on the TV.
+Teju Cast uses the same Cast Streaming protocol as Chrome's "Cast screen". It's a single Python tool that relies only on what your distro already ships (GStreamer, PipeWire, PyGObject, OpenSSL). There's no pip install and nothing to install on the TV.
 
 ```
-$ tvcast
-[tvcast] Target: Living Room TV (192.168.1.40)
-[tvcast] Got PipeWire stream (node 131)
-[tvcast] Audio output switched to "Living Room TV (tvcast)"
-[tvcast] TV accepted: H264 1920x1080@30 + Opus audio, target delay 150 ms
-[tvcast] Mirroring to Living Room TV. Ctrl+C to stop.
+$ tejucast
+[tejucast] Target: Living Room TV (192.168.1.40)
+[tejucast] Got PipeWire stream (node 131)
+[tejucast] Audio output switched to "Living Room TV (Teju Cast)"
+[tejucast] TV accepted: H264 1920x1080@30 + Opus audio, target delay 150 ms
+[tejucast] Mirroring to Living Room TV. Ctrl+C to stop.
 ```
 
 ## Features
 
 - **Low delay mirroring.** The TV shows each frame 150 ms after capture by default (`--delay`). There's no buffering phase like with video casting.
 - **Extend the desktop** (`--extend`). Creates a virtual 1920×1080 monitor that you can drag windows onto and arrange in your display settings.
-- **The TV shows up as a speaker.** While casting, a "*TV name* (tvcast)" output appears in your audio settings and becomes the default, so sound moves from the laptop to the TV. The volume slider controls the TV's volume. Your previous output is restored when you stop.
+- **The TV shows up as a speaker.** While casting, a "*TV name* (Teju Cast)" output appears in your audio settings and becomes the default, so sound moves from the laptop to the TV. The volume slider controls the TV's volume. Your previous output is restored when you stop.
 - **Pick a screen or a window** through the standard Wayland screen-sharing dialog. Your choice is remembered for next time.
 - **Handles Wi-Fi packet loss.** Lost packets are re-sent when the TV asks for them, and the TV can request a fresh keyframe.
 - **HLS fallback** (`--hls`). If mirroring doesn't work on your device, this mode has the TV's media player play a live video stream. It's more compatible but has a 3–5 s delay.
@@ -41,19 +41,19 @@ sudo dnf install python3-gobject gstreamer1-plugins-good gstreamer1-plugins-bad-
 ## Install
 
 ```sh
-git clone https://github.com/adurysurya/tvcast.git
-ln -s "$PWD/tvcast/tvcast.py" ~/.local/bin/tvcast
+git clone https://github.com/adurysurya/tejucast.git
+ln -s "$PWD/tejucast/tejucast.py" ~/.local/bin/tejucast
 ```
 
 ## Usage
 
 ```sh
-tvcast                 # mirror a screen/window to the first TV found
-tvcast --extend        # use the TV as a second monitor
-tvcast --list          # list Cast devices
-tvcast -d bedroom      # pick a TV by name (substring)
-tvcast --test          # send a test pattern + ticking audio
-tvcast --forget        # ask again which screen/window to share
+tejucast                 # mirror a screen/window to the first TV found
+tejucast --extend        # use the TV as a second monitor
+tejucast --list          # list Cast devices
+tejucast -d bedroom      # pick a TV by name (substring)
+tejucast --test          # send a test pattern + ticking audio
+tejucast --forget        # ask again which screen/window to share
 ```
 
 | Option | Default | |
@@ -70,6 +70,31 @@ tvcast --forget        # ask again which screen/window to share
 
 Stop with **Ctrl+C**, or press Back on the TV remote.
 
+### Running in the background
+
+```sh
+tejucast --background --extend   # start as a systemd user service (replaces a running one)
+tejucast --status                # current state as JSON
+tejucast --stop
+```
+
+## KDE Plasma system tray widget
+
+The `plasma/` folder contains a **Teju Cast** widget that sits in the system tray next to the audio, Wi-Fi and battery icons. Clicking it opens a popup that works like the Bluetooth and network ones:
+
+- It lists the TVs on your network. Each row has a **Mirror** / **Stop** button, and you can expand it for **Extend Desktop**.
+- It shows live status, such as "Mirroring · 1080p · 150 ms" or "Choose what to share in the dialog…".
+- It has settings for sound (TV only, TV and computer, or off), quality (1080p or 720p) and delay.
+- The tray icon gets a green dot while casting. Middle-click the icon to stop.
+
+Install it (needs `tejucast` on your `PATH`, e.g. `~/.local/bin/tejucast`):
+
+```sh
+kpackagetool6 -t Plasma/Applet -i plasma      # use -u to upgrade later
+```
+
+Then go to **System Tray Settings → Entries**, find **Teju Cast** and set it to *Always shown*.
+
 ## How it works
 
 1. **Capture.** The xdg-desktop-portal ScreenCast API hands over a PipeWire stream of a monitor, a window, or a new virtual monitor.
@@ -85,7 +110,7 @@ The wire format follows Google's open-source [Open Screen](https://chromium.goog
 - No hardware encoding yet. OpenH264 1080p30 on the CPU is fine on modern machines.
 - Fixed bitrate: there's no bandwidth adaptation yet.
 - On KDE the virtual monitor is fixed at 1920×1080.
-- Running tvcast on X11 isn't supported (it needs the Wayland portal).
+- Running tejucast on X11 isn't supported (it needs the Wayland portal).
 
 ## License
 
