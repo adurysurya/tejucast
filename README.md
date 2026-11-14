@@ -97,7 +97,7 @@ Setup:
    git clone https://github.com/omarroth/doubletake ~/src/doubletake
    cd ~/src/doubletake && make && ln -s "$PWD/bin/doubletake" ~/.local/bin/doubletake
    ```
-2. **Extend over AirPlay** also needs a small doubletake change: when `DOUBLETAKE_PORTAL_SOURCE=virtual` is set, it asks the portal for a virtual monitor (source type 4) instead of an existing one. It's in [`patches/doubletake-virtual-monitor.patch`](patches/doubletake-virtual-monitor.patch); apply it with `git apply` before building. Mirroring works with stock doubletake.
+2. **Extend over AirPlay** needs doubletake's `-virtual-display` flag, proposed upstream in [omarroth/doubletake#81](https://github.com/omarroth/doubletake/pull/81). Until it's merged, apply [`patches/doubletake-virtual-monitor.patch`](patches/doubletake-virtual-monitor.patch) with `git apply` before building. Teju Cast detects the flag automatically. Mirroring works with stock doubletake.
 
 Tested with a Google TV that also supports AirPlay. That TV doesn't use FairPlay, so doubletake connects through pairing alone. Apple TVs are covered by doubletake's own testing.
 

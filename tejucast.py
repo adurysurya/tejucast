@@ -1035,6 +1035,14 @@ def find_doubletake():
     return None
 
 
+def doubletake_supports(exe, flag):
+    try:
+        out = subprocess.run([exe, "-h"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return f"\n  {flag}" in "\n" + out.stdout + out.stderr
+
+
 def send_pin(pin):
     try:
         fd = os.open(PIN_FIFO, os.O_WRONLY | os.O_NONBLOCK)
@@ -1062,7 +1070,10 @@ def run_airplay(args, host, name):
         cmd.append("-test")
     env = dict(os.environ)
     if args.extend:
-        env["DOUBLETAKE_PORTAL_SOURCE"] = "virtual"  # needs doubletake with the virtual-source patch
+        if doubletake_supports(exe, "-virtual-display"):
+            cmd.append("-virtual-display")  # upstream flag (omarroth/doubletake#81)
+        else:
+            env["DOUBLETAKE_PORTAL_SOURCE"] = "virtual"  # older builds with patches/doubletake-virtual-monitor.patch
     os.makedirs(STATUS_DIR, exist_ok=True)
     try:
         os.unlink(PIN_FIFO)

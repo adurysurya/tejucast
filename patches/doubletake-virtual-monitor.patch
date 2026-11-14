@@ -1,37 +1,385 @@
+diff --git a/README.md b/README.md
+index 7d94c55..71e4bbb 100644
+--- a/README.md
++++ b/README.md
+@@ -278,6 +278,7 @@ doubletake-ctl disconnect
+ | `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
+ | `-no-audio` | false | Disable audio streaming |
+ | `-test` | false | Use synthetic video source |
++| `-virtual-display` | false | Wayland: create a new virtual monitor and stream it, so the receiver extends the desktop instead of mirroring a screen (needs a portal with virtual source support, e.g. KDE Plasma 6) |
+ | `-daemonize` | false | Run as background daemon with Unix socket control interface |
+ | `-socket` | `$XDG_RUNTIME_DIR/doubletake.sock` | Daemon control socket path |
+ | `-debug` | false | Verbose debug logging |
+diff --git a/cmd/doubletake/main.go b/cmd/doubletake/main.go
+index 20053db..f66f990 100644
+--- a/cmd/doubletake/main.go
++++ b/cmd/doubletake/main.go
+@@ -80,6 +80,7 @@ func main() {
+ 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
+ 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
+ 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
++	virtualDisplay := flag.Bool("virtual-display", false, "Wayland: create a new virtual monitor and stream it, so the receiver extends the desktop instead of mirroring a screen")
+ 	flag.Parse()
+ 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
+ 		log.Fatalf("invalid -hwaccel: %v", err)
+@@ -104,22 +105,23 @@ func main() {
+ 
+ 	if *daemonize {
+ 		runDaemon(daemon.Config{
+-			SocketPath:  *socketPath,
+-			CredFile:    *credFile,
+-			CredBackend: *credBackend,
+-			FPS:         *fps,
+-			Bitrate:     *bitrate,
+-			PortMin:     portMin,
+-			PortMax:     portMax,
+-			HWAccel:     *hwaccel,
+-			VideoCodec:  airplay.VideoCodec(*videoCodec),
+-			Debug:       *debug,
+-			TestMode:    *testMode,
+-			NoEncrypt:   *noEncrypt,
+-			DirectKey:   *directKey,
+-			NoAudio:     *noAudio,
+-			ShowCursor:  !*noCursor,
+-			Code:        credential,
++			SocketPath:     *socketPath,
++			CredFile:       *credFile,
++			CredBackend:    *credBackend,
++			FPS:            *fps,
++			Bitrate:        *bitrate,
++			PortMin:        portMin,
++			PortMax:        portMax,
++			HWAccel:        *hwaccel,
++			VideoCodec:     airplay.VideoCodec(*videoCodec),
++			Debug:          *debug,
++			TestMode:       *testMode,
++			NoEncrypt:      *noEncrypt,
++			DirectKey:      *directKey,
++			NoAudio:        *noAudio,
++			ShowCursor:     !*noCursor,
++			VirtualDisplay: *virtualDisplay,
++			Code:           credential,
+ 		})
+ 		return
+ 	}
+@@ -339,13 +341,14 @@ func main() {
+ 	// information. Some current receivers omit displays before that session
+ 	// exists; committing the pipeline earlier silently selects the 720p fallback.
+ 	captureCfg := airplay.CaptureConfig{
+-		FPS:           *fps,
+-		Bitrate:       *bitrate,
+-		HWAccel:       *hwaccel,
+-		VideoCodec:    airplay.VideoCodec(*videoCodec),
+-		X11WindowID:   xid,
+-		X11WindowName: *x11WindowName,
+-		ShowCursor:    !*noCursor,
++		FPS:            *fps,
++		Bitrate:        *bitrate,
++		HWAccel:        *hwaccel,
++		VideoCodec:     airplay.VideoCodec(*videoCodec),
++		X11WindowID:    xid,
++		X11WindowName:  *x11WindowName,
++		ShowCursor:     !*noCursor,
++		VirtualDisplay: *virtualDisplay,
+ 	}
+ 	if *testMode {
+ 		if *noAudio {
 diff --git a/internal/airplay/capture.go b/internal/airplay/capture.go
-index 13bc64d..4390b37 100644
+index 13bc64d..80587fa 100644
 --- a/internal/airplay/capture.go
 +++ b/internal/airplay/capture.go
-@@ -2516,13 +2516,21 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
+@@ -42,6 +42,10 @@ type CaptureConfig struct {
+ 	X11WindowName string
+ 
+ 	ShowCursor bool // show the mouse cursor in the captured video (Wayland and X11)
++	// VirtualDisplay asks the Wayland ScreenCast portal for a new virtual
++	// monitor instead of an existing screen, so the receiver acts as an
++	// extended display. Virtual sessions are never persisted or restored.
++	VirtualDisplay bool
+ 
+ 	RestoreToken     string
+ 	SaveRestoreToken func(string) error
+@@ -223,7 +227,13 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
+ 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
+ 		return nil, err
+ 	}
++	if cfg.VirtualDisplay && (cfg.X11WindowID != 0 || cfg.X11WindowName != "") {
++		return nil, fmt.Errorf("virtual display cannot be combined with X11 window capture")
++	}
+ 	kind := capturePreparationX11
++	if cfg.VirtualDisplay && os.Getenv("WAYLAND_DISPLAY") == "" {
++		return nil, fmt.Errorf("virtual display requires a Wayland session with a ScreenCast portal")
++	}
+ 	if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
+ 		kind = capturePreparationX11
+ 	} else if os.Getenv("WAYLAND_DISPLAY") != "" {
+@@ -278,7 +288,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
+ 	if err := probeWaylandDisplay(ctx, os.Getenv("WAYLAND_DISPLAY")); err != nil {
+ 		return nil, err
+ 	}
+-	nodeID, pwFd, portal, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, &preparation.streamSize)
++	nodeID, pwFd, portal, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, cfg.VirtualDisplay, &preparation.streamSize)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("screencast portal: %w", err)
+ 	}
+@@ -2436,7 +2446,7 @@ func normalizeContext(ctx context.Context) context.Context {
+ // permission and returns a PipeWire node ID, an fd for the portal's PipeWire remote,
+ // the retained portal session (which must stay open for capture and retries), and a
+ // fresh restore token when the portal grants persistence.
+-func requestScreencast(ctx context.Context, restoreToken string, showCursor bool, dimensions *[2]int) (uint32, *os.File, pipeWirePortalSession, string, error) {
++func requestScreencast(ctx context.Context, restoreToken string, showCursor, virtualDisplay bool, dimensions *[2]int) (uint32, *os.File, pipeWirePortalSession, string, error) {
+ 	ctx = normalizeContext(ctx)
+ 	conn, err := dbus.ConnectSessionBus()
+ 	if err != nil {
+@@ -2451,6 +2461,12 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
+ 
+ 	portalObject := conn.Object(portalBusName, portalObjectPath)
+ 	portalVersion := screenCastPortalVersion(ctx, portalObject)
++	if virtualDisplay {
++		available := screenCastAvailableSourceTypes(ctx, portalObject)
++		if available&portalSourceTypeVirtual == 0 {
++			return 0, nil, nil, "", fmt.Errorf("the ScreenCast portal does not offer virtual monitors (AvailableSourceTypes=%d); it needs e.g. KDE Plasma 6 or a recent GNOME", available)
++		}
++	}
+ 	baseToken, err := newPortalHandleToken()
+ 	if err != nil {
+ 		return 0, nil, nil, "", err
+@@ -2516,18 +2532,12 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
  	if err != nil {
  		return 0, nil, nil, "", err
  	}
-+	// DOUBLETAKE_PORTAL_SOURCE=virtual asks the portal for a new virtual monitor
-+	// (VIRTUAL=4) so the receiver becomes an extended display. Virtual sessions
-+	// are never persisted, so the saved monitor restore token is left untouched.
-+	virtualSource := os.Getenv("DOUBLETAKE_PORTAL_SOURCE") == "virtual"
-+	sourceTypes := uint32(1) // MONITOR=1, WINDOW=2, VIRTUAL=4
-+	if virtualSource {
-+		sourceTypes = 4
-+	}
- 	selectOpts := map[string]dbus.Variant{
- 		"handle_token": dbus.MakeVariant(selectToken),
+-	selectOpts := map[string]dbus.Variant{
+-		"handle_token": dbus.MakeVariant(selectToken),
 -		"types":        dbus.MakeVariant(uint32(1)), // MONITOR=1, WINDOW=2
-+		"types":        dbus.MakeVariant(sourceTypes),
- 		"multiple":     dbus.MakeVariant(false),
- 		"cursor_mode":  dbus.MakeVariant(cursorMode),
+-		"multiple":     dbus.MakeVariant(false),
+-		"cursor_mode":  dbus.MakeVariant(cursorMode),
++	selectOpts := screenCastSelectOptions(selectToken, cursorMode, portalVersion, restoreToken, virtualDisplay)
++	if _, ok := selectOpts["restore_token"]; ok {
++		dbg("[CAPTURE] requesting screencast restore with saved token")
  	}
 -	if portalVersion >= 4 {
-+	if portalVersion >= 4 && !virtualSource {
- 		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(2))
- 		if restoreToken != "" {
- 			selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
-@@ -2579,7 +2587,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
+-		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(2))
+-		if restoreToken != "" {
+-			selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
+-			dbg("[CAPTURE] requesting screencast restore with saved token")
+-		}
++	if virtualDisplay {
++		dbg("[CAPTURE] requesting a new virtual monitor from the ScreenCast portal")
+ 	}
+ 
+ 	selectCtx, cancelSelect := context.WithTimeout(ctx, portalControlPhaseTimeout)
+@@ -2579,7 +2589,8 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
  	}
  
  	newRestoreToken := ""
 -	if variant, ok := startResult["restore_token"]; ok {
-+	if variant, ok := startResult["restore_token"]; ok && !virtualSource {
++	// A virtual monitor's token must not replace the saved token for the real screen.
++	if variant, ok := startResult["restore_token"]; ok && !virtualDisplay {
  		value, ok := variant.Value().(string)
  		if !ok {
  			return 0, nil, nil, "", fmt.Errorf("unexpected restore token type: %T", variant.Value())
+@@ -2816,6 +2827,54 @@ func newPortalHandleToken() (string, error) {
+ 	return "doubletake_" + hex.EncodeToString(random[:]), nil
+ }
+ 
++// ScreenCast portal source types (org.freedesktop.portal.ScreenCast).
++const (
++	portalSourceTypeMonitor = uint32(1)
++	portalSourceTypeWindow  = uint32(2)
++	portalSourceTypeVirtual = uint32(4)
++)
++
++// screenCastSelectOptions builds the SelectSources options. A virtual display
++// asks for a new virtual monitor and is never persisted or restored, so the
++// saved token for the user's real screen stays valid.
++func screenCastSelectOptions(handleToken string, cursorMode, portalVersion uint32, restoreToken string, virtualDisplay bool) map[string]dbus.Variant {
++	sourceTypes := portalSourceTypeMonitor
++	if virtualDisplay {
++		sourceTypes = portalSourceTypeVirtual
++	}
++	opts := map[string]dbus.Variant{
++		"handle_token": dbus.MakeVariant(handleToken),
++		"types":        dbus.MakeVariant(sourceTypes),
++		"multiple":     dbus.MakeVariant(false),
++		"cursor_mode":  dbus.MakeVariant(cursorMode),
++	}
++	if portalVersion >= 4 && !virtualDisplay {
++		opts["persist_mode"] = dbus.MakeVariant(uint32(2))
++		if restoreToken != "" {
++			opts["restore_token"] = dbus.MakeVariant(restoreToken)
++		}
++	}
++	return opts
++}
++
++func screenCastAvailableSourceTypes(ctx context.Context, portal dbus.BusObject) uint32 {
++	callCtx, cancel := context.WithTimeout(normalizeContext(ctx), portalMethodTimeout)
++	defer cancel()
++	call := portal.CallWithContext(callCtx, "org.freedesktop.DBus.Properties.Get", 0,
++		portalScreenCastInterface, "AvailableSourceTypes")
++	var variant dbus.Variant
++	if err := call.Store(&variant); err != nil {
++		dbg("[CAPTURE] unable to read ScreenCast AvailableSourceTypes: %v", err)
++		return 0
++	}
++	types, ok := variant.Value().(uint32)
++	if !ok {
++		dbg("[CAPTURE] unexpected AvailableSourceTypes type: %T", variant.Value())
++		return 0
++	}
++	return types
++}
++
+ func screenCastPortalVersion(ctx context.Context, portal dbus.BusObject) uint32 {
+ 	callCtx, cancel := context.WithTimeout(normalizeContext(ctx), portalMethodTimeout)
+ 	defer cancel()
+diff --git a/internal/airplay/capture_test.go b/internal/airplay/capture_test.go
+index 0b70123..dcf2444 100644
+--- a/internal/airplay/capture_test.go
++++ b/internal/airplay/capture_test.go
+@@ -1615,3 +1615,58 @@ func TestH264TestCaptureStartupProbePreservesRealGStreamerOutput(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestScreenCastSelectOptionsMonitorPersistsAndRestores(t *testing.T) {
++	opts := screenCastSelectOptions("tok", 2, 5, "saved-token", false)
++	if got := opts["types"].Value(); got != portalSourceTypeMonitor {
++		t.Fatalf("types = %v, want monitor (%d)", got, portalSourceTypeMonitor)
++	}
++	if got := opts["persist_mode"].Value(); got != uint32(2) {
++		t.Fatalf("persist_mode = %v, want 2", got)
++	}
++	if got := opts["restore_token"].Value(); got != "saved-token" {
++		t.Fatalf("restore_token = %v, want saved-token", got)
++	}
++	if got := opts["cursor_mode"].Value(); got != uint32(2) {
++		t.Fatalf("cursor_mode = %v, want 2", got)
++	}
++}
++
++func TestScreenCastSelectOptionsOldPortalSkipsPersistence(t *testing.T) {
++	opts := screenCastSelectOptions("tok", 1, 3, "saved-token", false)
++	if _, ok := opts["persist_mode"]; ok {
++		t.Fatal("persist_mode must not be sent to portal version < 4")
++	}
++	if _, ok := opts["restore_token"]; ok {
++		t.Fatal("restore_token must not be sent to portal version < 4")
++	}
++}
++
++func TestScreenCastSelectOptionsVirtualDisplay(t *testing.T) {
++	opts := screenCastSelectOptions("tok", 2, 5, "saved-token", true)
++	if got := opts["types"].Value(); got != portalSourceTypeVirtual {
++		t.Fatalf("types = %v, want virtual (%d)", got, portalSourceTypeVirtual)
++	}
++	if _, ok := opts["persist_mode"]; ok {
++		t.Fatal("virtual display sessions must not be persisted")
++	}
++	if _, ok := opts["restore_token"]; ok {
++		t.Fatal("virtual display must not restore the saved monitor token")
++	}
++}
++
++func TestPrepareCaptureRejectsVirtualDisplayWithX11Window(t *testing.T) {
++	_, err := PrepareCapture(context.Background(), CaptureConfig{VirtualDisplay: true, X11WindowName: "xterm"})
++	if err == nil || !strings.Contains(err.Error(), "virtual display cannot be combined") {
++		t.Fatalf("err = %v, want virtual display/X11 conflict", err)
++	}
++}
++
++func TestPrepareCaptureRejectsVirtualDisplayWithoutWayland(t *testing.T) {
++	t.Setenv("WAYLAND_DISPLAY", "")
++	t.Setenv("DISPLAY", ":0")
++	_, err := PrepareCapture(context.Background(), CaptureConfig{VirtualDisplay: true})
++	if err == nil || !strings.Contains(err.Error(), "requires a Wayland session") {
++		t.Fatalf("err = %v, want Wayland requirement", err)
++	}
++}
+diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
+index f00cc8a..a5455d4 100644
+--- a/internal/daemon/daemon.go
++++ b/internal/daemon/daemon.go
+@@ -101,7 +101,9 @@ type Config struct {
+ 	DirectKey   bool
+ 	NoAudio     bool
+ 	ShowCursor  bool
+-	Code        string // default pairing/Digest credential; request Pin overrides it
++	// VirtualDisplay streams a new virtual monitor (extended desktop) on Wayland.
++	VirtualDisplay bool
++	Code           string // default pairing/Digest credential; request Pin overrides it
+ }
+ 
+ func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
+@@ -1324,12 +1326,13 @@ func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID
+ 		codec = codecs[0]
+ 	}
+ 	cfg := airplay.CaptureConfig{
+-		FPS:          d.cfg.FPS,
+-		Bitrate:      d.cfg.Bitrate,
+-		HWAccel:      d.cfg.HWAccel,
+-		VideoCodec:   codec,
+-		ShowCursor:   d.cfg.ShowCursor,
+-		RestoreToken: restoreToken,
++		FPS:            d.cfg.FPS,
++		Bitrate:        d.cfg.Bitrate,
++		HWAccel:        d.cfg.HWAccel,
++		VideoCodec:     codec,
++		ShowCursor:     d.cfg.ShowCursor,
++		VirtualDisplay: d.cfg.VirtualDisplay,
++		RestoreToken:   restoreToken,
+ 	}
+ 	if deviceID != "" {
+ 		cfg.SaveRestoreToken = func(token string) error {
+@@ -1485,14 +1488,15 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
+ 	d.mu.Unlock()
+ 
+ 	capCfg := airplay.CaptureConfig{
+-		FPS:          d.cfg.FPS,
+-		Bitrate:      d.cfg.Bitrate,
+-		HWAccel:      d.cfg.HWAccel,
+-		VideoCodec:   codec,
+-		MaxWidth:     key.maxWidth,
+-		MaxHeight:    key.maxHeight,
+-		ShowCursor:   d.cfg.ShowCursor,
+-		RestoreToken: restoreToken,
++		FPS:            d.cfg.FPS,
++		Bitrate:        d.cfg.Bitrate,
++		HWAccel:        d.cfg.HWAccel,
++		VideoCodec:     codec,
++		MaxWidth:       key.maxWidth,
++		MaxHeight:      key.maxHeight,
++		ShowCursor:     d.cfg.ShowCursor,
++		VirtualDisplay: d.cfg.VirtualDisplay,
++		RestoreToken:   restoreToken,
+ 	}
+ 	if deviceID != "" {
+ 		capCfg.SaveRestoreToken = func(token string) error {
+diff --git a/man/man1/doubletake.1 b/man/man1/doubletake.1
+index 6cb5b4f..9325ed3 100644
+--- a/man/man1/doubletake.1
++++ b/man/man1/doubletake.1
+@@ -93,6 +93,13 @@ forced \fBhevc\fR. Automatic mode uses H.264 at the receiver's nominal canvas.
+ Forced HEVC uses the receiver's maximum canvas and may also use x265.
+ Main10 output does not fabricate HDR metadata for an SDR capture source.
+ .TP
++.B \-virtual\-display
++On Wayland, ask the ScreenCast portal for a new virtual monitor and stream
++it, so the receiver extends the desktop instead of mirroring an existing
++screen. Requires a portal that offers virtual sources (for example KDE
++Plasma 6). The virtual monitor is removed when streaming stops; its session
++is never persisted, so the saved restore token for the real screen is kept.
++.TP
+ .B \-debug
+ Enable verbose protocol logging
+ .TP
+@@ -113,6 +120,9 @@ Pair with a PIN (saves credentials for reuse):
+ Connect to a receiver with "Require Password" enabled:
+ .B DOUBLETAKE_CODE=... doubletake \-target 192.168.1.77
+ .TP
++Use the receiver as an extended display (Wayland):
++.B doubletake \-target 192.168.1.77 \-virtual\-display
++.TP
+ Stream with a custom frame rate and bitrate:
+ .B doubletake \-target 192.168.1.77 \-fps 30 \-bitrate 4500
+ .TP
