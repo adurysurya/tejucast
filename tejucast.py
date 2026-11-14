@@ -12,6 +12,7 @@ No third-party Python packages needed (uses PyGObject + GStreamer from the OS).
 """
 import argparse
 import json
+import re
 import os
 import shutil
 import signal
@@ -77,9 +78,28 @@ CACHE_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~
                           "devices.json")
 
 
+SERVICES = {"_googlecast._tcp": "cast", "_airplay._tcp": "airplay"}
+
+
+def _avahi_unescape(text):
+    """avahi-browse -p escapes names: spaces/UTF-8 bytes appear as \\DDD (decimal)."""
+    out, i = bytearray(), 0
+    while i < len(text):
+        if text[i] == "\\" and i + 4 <= len(text) and text[i + 1:i + 4].isdigit():
+            out.append(int(text[i + 1:i + 4]) & 0xFF)
+            i += 4
+        elif text[i] == "\\" and i + 1 < len(text):
+            out += text[i + 1].encode()
+            i += 2
+        else:
+            out += text[i].encode()
+            i += 1
+    return out.decode("utf-8", "replace")
+
+
 def _parse_avahi_line(line):
     f = line.split(";")
-    if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+    if len(f) < 10 or f[0] != "=" or f[2] != "IPv4" or f[4] not in SERVICES:
         return None
     txt = {}
     for tok in f[9].split('" "'):
@@ -87,47 +107,81 @@ def _parse_avahi_line(line):
         if "=" in tok:
             k, v = tok.split("=", 1)
             txt[k] = v
-    return {"name": txt.get("fn", f[3]), "model": txt.get("md", ""), "host": f[7], "port": int(f[8]),
-            "id": txt.get("id", f[3])}
+    if SERVICES[f[4]] == "cast":
+        return {"name": txt.get("fn", _avahi_unescape(f[3])), "model": txt.get("md", ""), "host": f[7],
+                "port": int(f[8]), "id": txt.get("id", f[3]), "protocols": ["cast"]}
+    return {"name": _avahi_unescape(f[3]), "model": txt.get("model", ""), "host": f[7],
+            "airplay_port": int(f[8]), "id": "airplay:" + txt.get("deviceid", f[3]), "protocols": ["airplay"]}
+
+
+def _merge(into, d):
+    """Combine the Cast and AirPlay records of one device (same IP). Cast naming wins."""
+    if not into:
+        return dict(d)
+    cast_first = "cast" in d["protocols"]
+    base, extra = (dict(d), into) if cast_first else (dict(into), d)
+    for k, v in extra.items():
+        base.setdefault(k, v)
+    base["protocols"] = sorted(set(into["protocols"]) | set(d["protocols"]))
+    return base
 
 
 def discover(timeout=3.0, use_cache=True):
-    """Find Cast devices via avahi (listens `timeout` s; the TV can be slow to answer).
-    Devices seen before are remembered so front-ends can list them instantly."""
+    """Find Google Cast and AirPlay receivers via avahi (listens `timeout` s; TVs can be slow
+    to answer). Devices seen before are remembered so front-ends can list them instantly."""
     import select
-    found = {}
-    try:
-        proc = subprocess.Popen(["avahi-browse", "-rp", "_googlecast._tcp"], stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True)
-    except FileNotFoundError:
-        proc = None
-    if proc:
-        end = time.time() + timeout
-        buf = ""
+    by_host = {}
+    procs = []
+    for svc in SERVICES:
         try:
-            while time.time() < end:
-                r, _, _ = select.select([proc.stdout], [], [], max(0.0, end - time.time()))
-                if not r:
-                    break
-                chunk = os.read(proc.stdout.fileno(), 65536).decode(errors="replace")
+            procs.append(subprocess.Popen(["avahi-browse", "-rp", svc], stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL))
+        except FileNotFoundError:
+            break
+    bufs = {p.stdout.fileno(): "" for p in procs}
+    end = time.time() + timeout
+    try:
+        open_fds = set(bufs)
+        while open_fds and time.time() < end:
+            r, _, _ = select.select(list(open_fds), [], [], max(0.0, end - time.time()))
+            if not r:
+                break
+            for fd in r:
+                chunk = os.read(fd, 65536).decode(errors="replace")
                 if not chunk:
-                    break
-                buf += chunk
-                *lines, buf = buf.split("\n")
+                    open_fds.discard(fd)
+                    continue
+                bufs[fd] += chunk
+                *lines, bufs[fd] = bufs[fd].split("\n")
                 for line in lines:
                     d = _parse_avahi_line(line)
                     if d:
-                        found[d["id"]] = d
-        finally:
-            proc.kill()
-            proc.wait()
+                        by_host[d["host"]] = _merge(by_host.get(d["host"]), d)
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+    found = {d["id"]: d for d in by_host.values()}
     cache = {}
     try:
         with open(CACHE_FILE) as f:
-            cache = {d["id"]: d for d in json.load(f)}
+            cache = {d["id"]: d for d in json.load(f) if "protocols" in d}
     except (OSError, ValueError, KeyError, TypeError):
         pass
+    # TVs often answer for only one of their services per scan: keep protocols seen before
+    # on the same IP, so e.g. AirPlay doesn't vanish from a TV that also speaks Cast.
+    for key, d in list(found.items()):
+        for old in cache.values():
+            if old.get("host") == d["host"] and set(old["protocols"]) - set(d["protocols"]):
+                merged = _merge(d, dict(old, protocols=[p for p in old["protocols"]
+                                                         if p not in d["protocols"]]))
+                del found[key]
+                found[merged["id"]] = merged
+                break
     if found:
+        # drop stale cache entries for the same IP (e.g. an AirPlay-only record now merged)
+        live_hosts = {d["host"] for d in found.values()}
+        cache = {k: d for k, d in cache.items() if d.get("host") not in live_hosts}
         cache.update(found)
         try:
             os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
@@ -138,6 +192,7 @@ def discover(timeout=3.0, use_cache=True):
     devices = [dict(d, online=True) for d in found.values()]
     if use_cache:
         devices += [dict(d, online=False) for k, d in cache.items() if k not in found]
+    devices.sort(key=lambda d: (not d["online"], d["name"].lower()))
     return devices
 
 
@@ -592,7 +647,7 @@ def segments_ready(outdir, n=3):
 # --------------------------------------------------------------------------- main
 
 def main():
-    p = argparse.ArgumentParser(description="Stream your screen to a Google TV / Chromecast.")
+    p = argparse.ArgumentParser(description="Teju Cast: stream your screen to a Google TV / Chromecast or an AirPlay receiver.")
     p.add_argument("-d", "--device", help="TV name (substring match) - default: first found")
     p.add_argument("--host", help="TV IP address (skip discovery)")
     p.add_argument("-l", "--list", action="store_true", help="list Cast devices and exit")
@@ -611,6 +666,9 @@ def main():
     p.add_argument("--hls", action="store_true", help="use the older HLS video-stream mode (~4 s delay)")
     p.add_argument("--no-cast", action="store_true", help="only serve the HLS stream (for testing in VLC)")
     p.add_argument("--test", action="store_true", help="send a test pattern instead of the screen")
+    p.add_argument("-a", "--airplay", action="store_true",
+                   help="send over AirPlay (Apple TV, AirPlay TVs, Macs) using doubletake")
+    p.add_argument("--pin", metavar="PIN", help="send the AirPlay pairing PIN to a waiting tejucast")
     p.add_argument("--label", help="display name for the TV (with --host)")
     p.add_argument("--json", action="store_true", help="with --list: machine-readable output")
     p.add_argument("--background", action="store_true",
@@ -623,6 +681,8 @@ def main():
     if args.stop:
         subprocess.run(["systemctl", "--user", "stop", UNIT], capture_output=True)
         return 0
+    if args.pin is not None:
+        return send_pin(args.pin)
     if args.status:
         print(json.dumps(read_status()))
         return 0
@@ -634,6 +694,7 @@ def main():
     signal.signal(signal.SIGTERM, _term)  # clean up (audio, TV session) even before the main loop
     STATUS.enabled = not args.list
     STATUS.update(state="starting", mode="extend" if args.extend else ("hls" if args.hls else "mirror"),
+                  protocol="airplay" if args.airplay else "cast",
                   tv=args.label or args.device or args.host, started=time.time())
 
     if args.forget:
@@ -647,18 +708,22 @@ def main():
         if args.list and args.json:
             print(json.dumps(discover()))
             return 0
-        log("Looking for Cast devices...")
+        log("Looking for TVs...")
         devs = discover(use_cache=False)
         if args.list:
             for d in devs:
-                print(f"  {d['name']:<30} {d['model']:<20} {d['host']}")
+                protos = " + ".join("Google Cast" if p == "cast" else "AirPlay" for p in d["protocols"])
+                print(f"  {d['name']:<30} {d['model']:<20} {d['host']:<16} {protos}")
             if not devs:
                 print("  (none found)")
             return 0
+        proto = "airplay" if args.airplay else "cast"
+        devs = [d for d in devs if proto in d["protocols"]]
         if args.device:
             devs = [d for d in devs if args.device.lower() in d["name"].lower()]
         if not devs:
-            log("No matching Cast device found. Try --list or --host <ip>.")
+            log(f"No matching {'AirPlay' if args.airplay else 'Google Cast'} device found. "
+                "Try --list or --host <ip>.")
             return 1
         host, name = devs[0]["host"], devs[0]["name"]
     if host:
@@ -667,7 +732,7 @@ def main():
 
     Gst.init(None)
     fd = node = None
-    if not args.test:
+    if not args.test and not args.airplay:
         STATUS.update(state="choosing")
         if args.extend:
             log("Creating a virtual monitor for the TV...")
@@ -691,6 +756,8 @@ def main():
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             log(e, "- falling back to capturing the laptop output")
     try:
+        if args.airplay:
+            return run_airplay(args, host, name)
         if args.hls or args.no_cast:
             return run_hls(args, host, name, fd, node)
         return run_mirror(args, host, name, fd, node)
@@ -951,6 +1018,154 @@ def run_mirror(args, host, name, fd, node):
         pipeline.set_state(Gst.State.NULL)
         transport_udp.close()
     return runner.exit_code
+
+
+# --------------------------------------------------------------------------- mode 3: AirPlay (via doubletake)
+
+PIN_FIFO = os.path.join(STATUS_DIR, "pin")
+_TS = re.compile(r"^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d ")
+_PROMPT = re.compile(rb"Enter the (PIN|password)[^:\n]*: ")
+
+
+def find_doubletake():
+    for c in (os.environ.get("TEJUCAST_DOUBLETAKE"), shutil.which("doubletake"),
+              os.path.expanduser("~/src/doubletake/bin/doubletake")):
+        if c and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def send_pin(pin):
+    try:
+        fd = os.open(PIN_FIFO, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        print("No AirPlay pairing is waiting for a PIN.", file=sys.stderr)
+        return 1
+    try:
+        os.write(fd, (pin.strip() + "\n").encode())
+    finally:
+        os.close(fd)
+    return 0
+
+
+def run_airplay(args, host, name):
+    """Drive doubletake (AirPlay mirroring sender) and translate its output into our status."""
+    import select
+    exe = find_doubletake()
+    if not exe:
+        log("AirPlay needs doubletake (https://github.com/omarroth/doubletake) on your PATH.")
+        return 1
+    cmd = [exe, "-target", host, "-hwaccel", "openh264", "-fps", str(args.fps)]
+    if not args.audio:
+        cmd.append("-no-audio")
+    if args.test:
+        cmd.append("-test")
+    env = dict(os.environ)
+    if args.extend:
+        env["DOUBLETAKE_PORTAL_SOURCE"] = "virtual"  # needs doubletake with the virtual-source patch
+    os.makedirs(STATUS_DIR, exist_ok=True)
+    try:
+        os.unlink(PIN_FIFO)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(PIN_FIFO, 0o600)
+    pin_fd = os.open(PIN_FIFO, os.O_RDONLY | os.O_NONBLOCK)
+
+    STATUS.update(state="connecting", protocol="airplay")
+    log(f"Connecting to {name} over AirPlay...")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            env=env)
+    out_fd = proc.stdout.fileno()
+    tty = sys.stdin if sys.stdin and sys.stdin.isatty() else None
+    buf = b""
+    waiting_pin = False
+    failed = None
+
+    def give_pin(text):
+        nonlocal waiting_pin
+        text = text.strip()
+        if not text or proc.poll() is not None:
+            return
+        proc.stdin.write((text + "\n").encode())
+        proc.stdin.flush()
+        waiting_pin = False
+        STATUS.update(state="connecting")
+        log("PIN sent, pairing...")
+
+    def handle(line):
+        nonlocal failed
+        line = _TS.sub("", line).strip()
+        if not line:
+            return
+        if args.verbose:
+            log("doubletake:", line)
+        if "pairing complete" in line:
+            log(f"Paired with {name}.")
+        elif "screen capture started at" in line:
+            m = re.search(r"at (\d+)x(\d+)", line)
+            if m:
+                STATUS.update(width=int(m.group(1)), height=int(m.group(2)))
+        elif "mirror session ready" in line:
+            STATUS.update(state="streaming", codec="airplay", fps=args.fps, audio=args.audio,
+                          streaming_since=time.time())
+            what = "Extending desktop" if args.extend else "Mirroring"
+            log(f"{what} to {name} over AirPlay. Ctrl+C to stop.")
+        elif re.search(r"fail|error|refused|denied|unable|cannot", line, re.I):
+            failed = line
+            if not args.verbose:
+                log(line)
+
+    try:
+        while True:
+            fds = [out_fd, pin_fd] + ([tty] if tty else [])
+            r, _, _ = select.select(fds, [], [], 1.0)
+            if out_fd in r:
+                chunk = os.read(out_fd, 65536)
+                if not chunk:
+                    break
+                buf += chunk
+                m = _PROMPT.search(buf)
+                if m:
+                    for line in buf[:m.start()].split(b"\n"):
+                        handle(line.decode(errors="replace"))
+                    buf = buf[m.end():]
+                    waiting_pin = True
+                    STATUS.update(state="pin", message=f"Enter the {m.group(1).decode()} shown on {name}")
+                    log(f"Enter the {m.group(1).decode()} shown on {name}"
+                        + (" (type it here)" if tty else " (tejucast --pin 1234)"))
+                *lines, buf = buf.split(b"\n")
+                for line in lines:
+                    handle(line.decode(errors="replace"))
+            if pin_fd in r:
+                data = os.read(pin_fd, 256)
+                if data:
+                    give_pin(data.decode(errors="replace"))
+                else:  # writer closed: reopen so `select` stops reporting EOF
+                    os.close(pin_fd)
+                    pin_fd = os.open(PIN_FIFO, os.O_RDONLY | os.O_NONBLOCK)
+            if tty and tty in r:
+                line = tty.readline()
+                if waiting_pin:
+                    give_pin(line)
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        os.close(pin_fd)
+        try:
+            os.unlink(PIN_FIFO)
+        except FileNotFoundError:
+            pass
+    code = proc.wait()
+    if code != 0 and failed:
+        if "pair" in failed.lower():
+            failed += " (wrong or expired PIN? try again)"
+        STATUS.update(message=failed)
+    return 0 if code in (0, -signal.SIGINT) else 1
 
 
 # --------------------------------------------------------------------------- mode 2: HLS (compatible, ~4 s delay)

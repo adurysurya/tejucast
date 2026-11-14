@@ -1,0 +1,37 @@
+diff --git a/internal/airplay/capture.go b/internal/airplay/capture.go
+index 13bc64d..4390b37 100644
+--- a/internal/airplay/capture.go
++++ b/internal/airplay/capture.go
+@@ -2516,13 +2516,21 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
+ 	if err != nil {
+ 		return 0, nil, nil, "", err
+ 	}
++	// DOUBLETAKE_PORTAL_SOURCE=virtual asks the portal for a new virtual monitor
++	// (VIRTUAL=4) so the receiver becomes an extended display. Virtual sessions
++	// are never persisted, so the saved monitor restore token is left untouched.
++	virtualSource := os.Getenv("DOUBLETAKE_PORTAL_SOURCE") == "virtual"
++	sourceTypes := uint32(1) // MONITOR=1, WINDOW=2, VIRTUAL=4
++	if virtualSource {
++		sourceTypes = 4
++	}
+ 	selectOpts := map[string]dbus.Variant{
+ 		"handle_token": dbus.MakeVariant(selectToken),
+-		"types":        dbus.MakeVariant(uint32(1)), // MONITOR=1, WINDOW=2
++		"types":        dbus.MakeVariant(sourceTypes),
+ 		"multiple":     dbus.MakeVariant(false),
+ 		"cursor_mode":  dbus.MakeVariant(cursorMode),
+ 	}
+-	if portalVersion >= 4 {
++	if portalVersion >= 4 && !virtualSource {
+ 		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(2))
+ 		if restoreToken != "" {
+ 			selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
+@@ -2579,7 +2587,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
+ 	}
+ 
+ 	newRestoreToken := ""
+-	if variant, ok := startResult["restore_token"]; ok {
++	if variant, ok := startResult["restore_token"]; ok && !virtualSource {
+ 		value, ok := variant.Value().(string)
+ 		if !ok {
+ 			return 0, nil, nil, "", fmt.Errorf("unexpected restore token type: %T", variant.Value())

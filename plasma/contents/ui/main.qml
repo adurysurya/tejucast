@@ -25,7 +25,7 @@ PlasmoidItem {
     property bool installed: true
     property double optimisticUntil: 0   // keep "starting" visible until the service reports in
 
-    readonly property bool busyState: ["starting", "choosing", "connecting", "stopping"].indexOf(status.state) >= 0
+    readonly property bool busyState: ["starting", "choosing", "connecting", "stopping", "pin"].indexOf(status.state) >= 0
     readonly property bool streaming: status.state === "streaming"
     readonly property bool active: busyState || streaming
     readonly property string modeLabel: status.mode === "extend" ? i18n("Extending desktop") : i18n("Mirroring")
@@ -34,7 +34,8 @@ PlasmoidItem {
     readonly property var tvList: {
         const list = devices.slice();
         if (active && status.host && !list.some(d => d.host === status.host)) {
-            list.unshift({ name: status.tv || status.host, host: status.host, model: "", online: true });
+            list.unshift({ name: status.tv || status.host, host: status.host, model: "", online: true,
+                           protocols: [status.protocol || "cast"] });
         }
         return list;
     }
@@ -131,10 +132,18 @@ PlasmoidItem {
         });
     }
 
-    function start(dev, mode) {
+    function protocolsOf(dev) {
+        return dev.protocols || ["cast"];
+    }
+
+    function start(dev, mode, protocol) {
         const c = Plasmoid.configuration;
+        protocol = protocol || (protocolsOf(dev).indexOf("cast") >= 0 ? "cast" : "airplay");
         let cmd = tejucast + " --background --host " + q(dev.host) + " --label " + q(dev.name)
                 + " --delay " + c.delay + " --height " + c.height;
+        if (protocol === "airplay") {
+            cmd += " --airplay";
+        }
         if (mode === "extend") {
             cmd += " --extend";
         }
@@ -144,7 +153,7 @@ PlasmoidItem {
             cmd += " --no-audio";
         }
         optimisticUntil = Date.now() + 8000;
-        status = { state: "starting", tv: dev.name, host: dev.host, mode: mode };
+        status = { state: "starting", tv: dev.name, host: dev.host, mode: mode, protocol: protocol };
         exec.run(cmd, (code, out, err) => {
             if (code !== 0) {
                 optimisticUntil = 0;
@@ -152,6 +161,11 @@ PlasmoidItem {
                            message: (err || out || i18n("Could not start tejucast")).trim() };
             }
         });
+    }
+
+    function sendPin(pin) {
+        status = Object.assign({}, status, { state: "connecting" });
+        exec.run(tejucast + " --pin " + q(pin), () => refreshStatus());
     }
 
     function stop() {
@@ -255,6 +269,38 @@ PlasmoidItem {
                 text: root.status.message || i18n("Casting stopped because of an error.")
             }
 
+            // AirPlay pairing: the TV shows a PIN the first time
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.margins: Kirigami.Units.largeSpacing
+                visible: root.status.state === "pin"
+                spacing: Kirigami.Units.smallSpacing
+
+                PlasmaComponents3.Label {
+                    Layout.fillWidth: true
+                    text: i18n("Enter the PIN shown on %1", root.status.tv || i18n("the TV"))
+                    wrapMode: Text.WordWrap
+                    font.bold: true
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    PlasmaComponents3.TextField {
+                        id: pinField
+                        Layout.fillWidth: true
+                        placeholderText: i18n("PIN")
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        validator: RegularExpressionValidator { regularExpression: /[0-9]{0,8}/ }
+                        onAccepted: if (text.length >= 4) { root.sendPin(text); text = ""; }
+                    }
+                    PlasmaComponents3.Button {
+                        text: i18n("Pair")
+                        icon.name: "network-connect"
+                        enabled: pinField.text.length >= 4
+                        onClicked: { root.sendPin(pinField.text); pinField.text = ""; }
+                    }
+                }
+            }
+
             PlasmaComponents3.ScrollView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -283,6 +329,10 @@ PlasmoidItem {
                         required index
 
                         readonly property bool casting: root.active && root.status.host === modelData.host
+                        readonly property var protos: root.protocolsOf(modelData)
+                        readonly property bool hasCast: protos.indexOf("cast") >= 0
+                        readonly property bool hasAirPlay: protos.indexOf("airplay") >= 0
+                        readonly property bool castingAirPlay: casting && root.status.protocol === "airplay"
 
                         icon: "video-television"
                         iconEmblem: casting && root.streaming ? "emblem-checked" : ""
@@ -293,10 +343,14 @@ PlasmoidItem {
                                 case "starting": return i18n("Starting…");
                                 case "choosing": return i18n("Choose what to share in the dialog…");
                                 case "connecting": return i18n("Connecting…");
+                                case "pin": return i18n("Waiting for the pairing PIN…");
                                 case "stopping": return i18n("Stopping…");
                                 case "streaming":
                                     if (root.status.codec === "hls") {
                                         return i18n("%1 · video stream mode", root.modeLabel);
+                                    }
+                                    if (root.status.protocol === "airplay") {
+                                        return i18n("%1 over AirPlay · %2p", root.modeLabel, root.status.height);
                                     }
                                     return i18n("%1 · %2p · %3 ms", root.modeLabel, root.status.height, root.status.delay);
                                 }
@@ -304,7 +358,10 @@ PlasmoidItem {
                             if (modelData.online === false) {
                                 return i18n("Not found on the network");
                             }
-                            return modelData.model || i18n("Available");
+                            const names = [];
+                            if (hasCast) names.push(i18n("Google Cast"));
+                            if (hasAirPlay) names.push(i18n("AirPlay"));
+                            return (modelData.model ? modelData.model + " · " : "") + names.join(" + ");
                         }
                         isBusy: casting && root.busyState
                         showDefaultActionButtonWhenBusy: true
@@ -317,20 +374,42 @@ PlasmoidItem {
                             onTriggered: item.casting ? root.stop() : root.start(item.modelData, "mirror")
                         }
 
-                        contextualActions: [
-                            QQC2.Action {
-                                icon.name: "window-duplicate"
-                                text: i18n("Mirror Screen")
-                                enabled: !(item.casting && root.status.mode === "mirror")
-                                onTriggered: root.start(item.modelData, "mirror")
-                            },
-                            QQC2.Action {
-                                icon.name: "view-split-left-right"
-                                text: i18n("Extend Desktop")
-                                enabled: !(item.casting && root.status.mode === "extend")
-                                onTriggered: root.start(item.modelData, "extend")
-                            }
-                        ]
+                        // Default protocol: Google Cast when available (lowest delay), else AirPlay.
+                        readonly property string mainProto: hasCast ? "cast" : "airplay"
+                        readonly property bool mainActive: casting && (root.status.protocol || "cast") === mainProto
+
+                        QQC2.Action {
+                            id: mirrorAction
+                            icon.name: "window-duplicate"
+                            text: item.hasCast && item.hasAirPlay ? i18n("Mirror Screen (Google Cast)") : i18n("Mirror Screen")
+                            enabled: !(item.mainActive && root.status.mode === "mirror")
+                            onTriggered: root.start(item.modelData, "mirror", item.mainProto)
+                        }
+                        QQC2.Action {
+                            id: extendAction
+                            icon.name: "view-split-left-right"
+                            text: item.hasCast && item.hasAirPlay ? i18n("Extend Desktop (Google Cast)") : i18n("Extend Desktop")
+                            enabled: !(item.mainActive && root.status.mode === "extend")
+                            onTriggered: root.start(item.modelData, "extend", item.mainProto)
+                        }
+                        QQC2.Action {
+                            id: mirrorAirPlayAction
+                            icon.name: "window-duplicate"
+                            text: i18n("Mirror Screen (AirPlay)")
+                            enabled: !(item.castingAirPlay && root.status.mode === "mirror")
+                            onTriggered: root.start(item.modelData, "mirror", "airplay")
+                        }
+                        QQC2.Action {
+                            id: extendAirPlayAction
+                            icon.name: "view-split-left-right"
+                            text: i18n("Extend Desktop (AirPlay)")
+                            enabled: !(item.castingAirPlay && root.status.mode === "extend")
+                            onTriggered: root.start(item.modelData, "extend", "airplay")
+                        }
+
+                        contextualActions: hasCast && hasAirPlay
+                            ? [mirrorAction, extendAction, mirrorAirPlayAction, extendAirPlayAction]
+                            : [mirrorAction, extendAction]
                     }
 
                     PlasmaExtras.PlaceholderMessage {

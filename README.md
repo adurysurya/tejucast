@@ -1,6 +1,6 @@
 # Teju Cast
 
-Stream your Linux desktop to a **Google TV / Chromecast** with low delay: mirror your screen, or use the TV as a **second monitor**. Sound plays through the TV.
+Stream your Linux desktop to a **Google TV / Chromecast** or an **Apple TV / AirPlay** receiver with low delay: mirror your screen, or use the TV as a **second monitor**. Sound plays through the TV.
 
 Teju Cast uses the same Cast Streaming protocol as Chrome's "Cast screen". It's a single Python tool that relies only on what your distro already ships (GStreamer, PipeWire, PyGObject, OpenSSL). There's no pip install and nothing to install on the TV.
 
@@ -78,11 +78,35 @@ tejucast --status                # current state as JSON
 tejucast --stop
 ```
 
+## AirPlay (Apple TV, AirPlay TVs, Macs)
+
+Teju Cast can also send to **AirPlay** receivers. It uses [doubletake](https://github.com/omarroth/doubletake), an open-source AirPlay mirroring sender, which has a delay of about 75–85 ms. Teju Cast finds AirPlay devices alongside Cast ones, moves sound to the TV, reports status and runs the tray widget. doubletake does the AirPlay part.
+
+```sh
+tejucast --airplay                       # mirror to the first AirPlay receiver found
+tejucast --airplay -d "living room" -e   # extend the desktop over AirPlay
+tejucast --pin 1234                      # send the pairing PIN (or type it in the terminal)
+```
+
+The first time, the receiver shows a **PIN** on screen. Type it in the terminal, run `tejucast --pin`, or enter it in the tray popup. After that the pairing is remembered.
+
+Setup:
+
+1. Build doubletake (needs Go 1.25+):
+   ```sh
+   git clone https://github.com/omarroth/doubletake ~/src/doubletake
+   cd ~/src/doubletake && make && ln -s "$PWD/bin/doubletake" ~/.local/bin/doubletake
+   ```
+2. **Extend over AirPlay** also needs a small doubletake change: when `DOUBLETAKE_PORTAL_SOURCE=virtual` is set, it asks the portal for a virtual monitor (source type 4) instead of an existing one. It's in [`patches/doubletake-virtual-monitor.patch`](patches/doubletake-virtual-monitor.patch); apply it with `git apply` before building. Mirroring works with stock doubletake.
+
+Tested with a Google TV that also supports AirPlay. That TV doesn't use FairPlay, so doubletake connects through pairing alone. Apple TVs are covered by doubletake's own testing.
+
 ## KDE Plasma system tray widget
 
 The `plasma/` folder contains a **Teju Cast** widget that sits in the system tray next to the audio, Wi-Fi and battery icons. Clicking it opens a popup that works like the Bluetooth and network ones:
 
-- It lists the TVs on your network. Each row has a **Mirror** / **Stop** button, and you can expand it for **Extend Desktop**.
+- It lists the TVs on your network, both Google Cast and AirPlay. Each row has a **Mirror** / **Stop** button, and you can expand it for **Extend Desktop**. TVs that support both protocols get extra AirPlay options.
+- A PIN box appears when an AirPlay receiver needs pairing.
 - It shows live status, such as "Mirroring · 1080p · 150 ms" or "Choose what to share in the dialog…".
 - It has settings for sound (TV only, TV and computer, or off), quality (1080p or 720p) and delay.
 - The tray icon gets a green dot while casting. Middle-click the icon to stop.
